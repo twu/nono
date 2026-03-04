@@ -723,7 +723,7 @@ pub struct TrustSignArgs {
     #[arg(long)]
     pub all: bool,
 
-    /// Key ID to use from the system keystore (default: "default")
+    /// Key ID or op:// URI for the signing key (default: "default")
     #[arg(long, value_name = "KEY_ID", conflicts_with = "keyless")]
     pub key: Option<String>,
 
@@ -741,7 +741,7 @@ pub struct TrustSignPolicyArgs {
     /// Trust policy file to sign (default: trust-policy.json in CWD)
     pub file: Option<PathBuf>,
 
-    /// Key ID to use from the system keystore (default: "default")
+    /// Key ID or op:// URI for the signing key (default: "default")
     #[arg(long, value_name = "KEY_ID")]
     pub key: Option<String>,
 }
@@ -785,7 +785,7 @@ pub struct TrustKeygenArgs {
 
 #[derive(Parser, Debug)]
 pub struct TrustExportKeyArgs {
-    /// Key identifier to export (default: "default")
+    /// Key identifier or op:// URI to export (default: "default")
     #[arg(long, value_name = "NAME", default_value = "default")]
     pub id: String,
 

@@ -875,40 +875,68 @@ fn run_list(args: TrustListArgs) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Key loading from system keystore
+// Key loading from system keystore or 1Password
 // ---------------------------------------------------------------------------
 
-/// Load only the public key bytes for a given key ID from the keystore.
+/// Load only the public key bytes for a given key ID.
 ///
-/// Uses the `nono-trust-pub` service to avoid loading private key material
-/// into memory for verification-only operations.
+/// Dispatches by URI scheme:
+/// - `op://vault/item/field` — loaded via the 1Password CLI
+/// - Everything else — loaded from the system keyring (`nono-trust-pub` service)
+///
+/// Uses a separate service/field from the private key to avoid loading private
+/// key material into memory for verification-only operations.
 pub(crate) fn load_public_key_bytes(key_id: &str) -> Result<Vec<u8>> {
-    let entry = keyring::Entry::new(TRUST_PUB_SERVICE, key_id)
-        .map_err(|e| nono::NonoError::KeystoreAccess(format!("failed to access keystore: {e}")))?;
+    let b64 = if nono::is_op_uri(key_id) {
+        let secret = nono::load_secret_by_ref("unused", key_id)?;
+        // Zeroizing<String> -> String for base64_decode; public key is not sensitive
+        // but we still go through the same dispatch path for consistency.
+        String::from(secret.as_str())
+    } else {
+        let entry = keyring::Entry::new(TRUST_PUB_SERVICE, key_id).map_err(|e| {
+            nono::NonoError::KeystoreAccess(format!("failed to access keystore: {e}"))
+        })?;
 
-    let b64 = entry.get_password().map_err(|e| match e {
-        keyring::Error::NoEntry => nono::NonoError::SecretNotFound(format!(
-            "public key '{key_id}' not found in keystore (run 'nono trust keygen' to regenerate)"
-        )),
-        other => nono::NonoError::KeystoreAccess(format!(
-            "failed to load public key '{key_id}': {other}"
-        )),
-    })?;
+        entry.get_password().map_err(|e| match e {
+            keyring::Error::NoEntry => nono::NonoError::SecretNotFound(format!(
+                "public key '{key_id}' not found in keystore \
+                 (run 'nono trust keygen' to regenerate)"
+            )),
+            other => nono::NonoError::KeystoreAccess(format!(
+                "failed to load public key '{key_id}': {other}"
+            )),
+        })?
+    };
 
     base64_decode(&b64)
         .map_err(|e| nono::NonoError::KeystoreAccess(format!("corrupt public key data: {e}")))
 }
 
+/// Load a signing key (ECDSA P-256 PKCS#8) by key ID.
+///
+/// Dispatches by URI scheme:
+/// - `op://vault/item/field` — loaded via the 1Password CLI
+/// - Everything else — loaded from the system keyring (`nono-trust` service)
+///
+/// The stored value must be base64-encoded PKCS#8 in both cases.
 pub(crate) fn load_signing_key(key_id: &str) -> Result<trust::KeyPair> {
-    let entry = keyring::Entry::new(TRUST_SERVICE, key_id)
-        .map_err(|e| nono::NonoError::KeystoreAccess(format!("failed to access keystore: {e}")))?;
+    let pkcs8_b64 = if nono::is_op_uri(key_id) {
+        nono::load_secret_by_ref("unused", key_id)?
+    } else {
+        let entry = keyring::Entry::new(TRUST_SERVICE, key_id).map_err(|e| {
+            nono::NonoError::KeystoreAccess(format!("failed to access keystore: {e}"))
+        })?;
 
-    let pkcs8_b64 = Zeroizing::new(entry.get_password().map_err(|e| match e {
-        keyring::Error::NoEntry => nono::NonoError::SecretNotFound(format!(
-            "signing key '{key_id}' not found in keystore (run 'nono trust keygen' first)"
-        )),
-        other => nono::NonoError::KeystoreAccess(format!("failed to load key '{key_id}': {other}")),
-    })?);
+        Zeroizing::new(entry.get_password().map_err(|e| match e {
+            keyring::Error::NoEntry => nono::NonoError::SecretNotFound(format!(
+                "signing key '{key_id}' not found in keystore \
+                 (run 'nono trust keygen' first)"
+            )),
+            other => nono::NonoError::KeystoreAccess(format!(
+                "failed to load key '{key_id}': {other}"
+            )),
+        })?)
+    };
 
     let pkcs8_bytes = Zeroizing::new(base64_decode(pkcs8_b64.as_str()).map_err(|e| {
         nono::NonoError::KeystoreAccess(format!("corrupt key data in keystore: {e}"))
@@ -1148,5 +1176,57 @@ mod tests {
 
         std::env::set_current_dir(original).unwrap();
         result.unwrap();
+    }
+
+    // --- op:// dispatch in key loading ---
+
+    #[test]
+    fn load_signing_key_dispatches_op_uri() {
+        // Verify that op:// URIs are routed to the 1Password backend.
+        // We expect a 1Password-specific error (op not installed or auth),
+        // NOT a keyring "entry not found" error.
+        let err = match load_signing_key("op://vault/item/field") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error for op:// URI without 1Password"),
+        };
+        assert!(
+            err.contains("1Password"),
+            "expected 1Password error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_public_key_bytes_dispatches_op_uri() {
+        // Same dispatch check for the public key path.
+        let result = load_public_key_bytes("op://vault/item/public_key");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("1Password"),
+            "expected 1Password error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_signing_key_bare_id_uses_keyring() {
+        // Bare key IDs (no op:// prefix) should route to the keyring backend.
+        // We expect a keyring-specific error, NOT a 1Password error.
+        let err = match load_signing_key("nonexistent-test-key") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error for nonexistent key"),
+        };
+        assert!(
+            !err.contains("1Password"),
+            "bare key ID should use keyring, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_public_key_bytes_bare_id_uses_keyring() {
+        let result = load_public_key_bytes("nonexistent-test-key");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            !err.contains("1Password"),
+            "bare key ID should use keyring, got: {err}"
+        );
     }
 }
